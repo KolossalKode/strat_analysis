@@ -10,6 +10,12 @@ import plotly.graph_objects as go
 import time
 import warnings
 import tempfile
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    # Make dotenv optional. If not installed, user can enter API key manually.
+    load_dotenv = None
 import zipfile
 import io
 
@@ -28,6 +34,9 @@ except Exception:
 
 from alpha_vantage.timeseries import TimeSeries
 
+# Load environment variables from .env file at the start
+if load_dotenv:
+    load_dotenv()
 # ==============================================================================
 # SCRIPT CONFIGURATION & HELPER FUNCTIONS (Largely unchanged from original)
 # ==============================================================================
@@ -39,7 +48,7 @@ pd.options.mode.chained_assignment = None
 
 # --- Constants ---
 SYMBOLS_LIST = ['SPY', 'QQQ', 'XLC', 'XLY', 'XLP', 'XLE', 'XLF', 'XLV',
-                'XLI', 'XLB', 'XLRE', 'XLK', 'XLU']
+                'XLI', 'XLB', 'XLRE', 'XLK', 'XLU', 'MSFT', 'TSLA', 'GLD']
 PERFORMANCE_LOOKAHEAD = 10
 MIN_HIGHER_TFS_FOR_FTFC = 3
 SLEEP_BETWEEN_SYMBOLS = 1
@@ -397,15 +406,13 @@ with scanner_tab:
     # --- Sidebar for Inputs ---
     with st.sidebar:
         st.header("⚙️ Scanner Configuration")
-        api_key_input = st.text_input("Alpha Vantage API Key", type="password", help="Your free API key from alphavantage.co")
         selected_symbols = st.multiselect("Select Stock Symbols", options=SYMBOLS_LIST, default=['SPY', 'QQQ'])
         run_button = st.button("🚀 Run Analysis")
 
     # --- Main Area for Outputs ---
     if run_button:
-        if not api_key_input:
-            st.error("❌ Please enter your Alpha Vantage API Key in the sidebar.")
-        elif not selected_symbols:
+        api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
+        if not selected_symbols:
             st.error("❌ Please select at least one symbol to analyze.")
         else:
             st.session_state.analysis_complete = False
@@ -417,7 +424,7 @@ with scanner_tab:
             status_container = st.container(height=300, border=True)
 
             with st.spinner('Running... this may take several minutes depending on the number of symbols.'):
-                detailed_df, summary_df, charts = run_analysis(selected_symbols, api_key_input, status_container)
+                detailed_df, summary_df, charts = run_analysis(selected_symbols, api_key, status_container)
 
                 if detailed_df is not None:
                     st.session_state.analysis_complete = True

@@ -135,6 +135,91 @@ def _simulate_close_path(entry: float, closes: Iterable[float], side_sign: int, 
     return np.nanmean([r for r in exits_R if r is not None])
 
 
+def _simulate_ohlc_path(entry: float, ohlc_bars: pd.DataFrame, side_sign: int, risk: RiskModel) -> float:
+    """Simulate trade along OHLC bars; return total R across 3 contracts."""
+    if not np.isfinite(entry) or entry <= 0:
+        return np.nan
+
+    r_price = entry * risk.stop_pct
+
+    def price_at_R(r: float) -> float:
+        return entry + side_sign * r * r_price
+
+    def r_from_price(p: float) -> float:
+        return side_sign * (p - entry) / r_price
+
+    stop_price = price_at_R(-1.0)
+    t1_price = price_at_R(risk.scale_out_R[0])
+    t2_price = price_at_R(risk.scale_out_R[1])
+
+    exits_R: List[Optional[float]] = [None, None, None]
+    trailing_active = False
+    max_price_seen = entry
+    trailing_stop_price = -np.inf if side_sign > 0 else np.inf
+    last_close = entry
+
+    for _, bar in ohlc_bars.iterrows():
+        o, h, l, c = bar['open'], bar['high'], bar['low'], bar['close']
+        last_close = c
+        if not all(np.isfinite([o, h, l, c])):
+            continue
+
+        # --- Stop/trail check (conservative: check stops before targets) ---
+        # If a bar's low (for long) or high (for short) touches a stop, assume it's hit.
+        stop_hit_price = -np.inf
+        if side_sign > 0 and l <= stop_price:
+            stop_hit_price = stop_price
+        elif side_sign < 0 and h >= stop_price:
+            stop_hit_price = stop_price
+
+        if np.isfinite(stop_hit_price):
+            for i in range(3):
+                if exits_R[i] is None:
+                    exits_R[i] = r_from_price(stop_hit_price)
+            break  # Trade is over
+
+        if trailing_active and exits_R[2] is None:
+            trail_hit = False
+            if side_sign > 0 and l <= trailing_stop_price:
+                trail_hit = True
+            elif side_sign < 0 and h >= trailing_stop_price:
+                trail_hit = True
+
+            if trail_hit:
+                exits_R[2] = r_from_price(trailing_stop_price)
+                break  # Final contract exited
+
+        # --- Target check ---
+        # Assume targets are hit if high (long) or low (short) crosses them.
+        if exits_R[0] is None:
+            if (side_sign > 0 and h >= t1_price) or (side_sign < 0 and l <= t1_price):
+                exits_R[0] = risk.scale_out_R[0]
+
+        if exits_R[1] is None:
+            if (side_sign > 0 and h >= t2_price) or (side_sign < 0 and l <= t2_price):
+                exits_R[1] = risk.scale_out_R[1]
+                trailing_active = True
+
+        # --- Update state for next bar ---
+        if trailing_active:
+            if side_sign > 0:
+                max_price_seen = max(max_price_seen, h)
+                trailing_stop_price = max(trailing_stop_price, price_at_R(r_from_price(max_price_seen) - risk.trailing_gap_R))
+            else: # short
+                max_price_seen = min(max_price_seen, l)
+                trailing_stop_price = min(trailing_stop_price, price_at_R(r_from_price(max_price_seen) + risk.trailing_gap_R))
+
+        if all(r is not None for r in exits_R):
+            break
+
+    # If horizon ends, exit any remaining contracts at the last close
+    for i in range(3):
+        if exits_R[i] is None:
+            exits_R[i] = r_from_price(last_close)
+
+    return np.nanmean([r for r in exits_R if r is not None])
+
+
 def summarize_setups(
     df: pd.DataFrame,
     group_by: list[str],
@@ -143,13 +228,17 @@ def summarize_setups(
     side: str = 'long',
     min_samples: int = 1,
     risk: Optional[RiskModel] = None,
+    prices: Optional[Dict[str, pd.DataFrame]] = None,
 ) -> pd.DataFrame:
     """
     Produce per-setup summary with frequency, win rate, expectancy (R), and move profile.
     Expects detailed dataframe with columns described in README.
+    If `prices` is provided, uses OHLC simulation; otherwise, falls back to close-only.
     """
     if risk is None:
         risk = RiskModel()
+    if prices is None:
+        prices = {}
 
     df = df.copy()
     # Time filter for frequency
@@ -163,29 +252,41 @@ def summarize_setups(
     else:
         recent = df
 
-    # Compute expectancy (R) using close-to-close path
     horizon_max = max(horizons) if horizons else 10
+    side_sign_series = df.apply(lambda r: _side_sign(side, r.get('Higher TF Trend')), axis=1)
 
-    def path_closes(row) -> list[float]:
-        closes = []
+    def get_expectancy(row) -> float:
+        side_sign = side_sign_series.loc[row.name]
         entry = row.get('Entry Price', np.nan)
+        symbol = row.get('Symbol')
+        tf = row.get('Reversal Timeframe')
+        rev_time = row.get('Reversal Time')
+
+        # OHLC simulation if possible
+        price_key = f"{symbol}_{tf}"
+        if prices and price_key in prices and pd.notna(rev_time):
+            ohlc_df = prices[price_key]
+            try:
+                # Find bar *after* reversal time
+                fwd_bars_mask = ohlc_df.index > rev_time
+                if fwd_bars_mask.any():
+                    fwd_bars = ohlc_df[fwd_bars_mask].iloc[:horizon_max]
+                    if not fwd_bars.empty:
+                        return _simulate_ohlc_path(entry, fwd_bars, side_sign, risk)
+            except Exception:
+                # Fallback on error
+                pass
+
+        # Fallback to close-only simulation
+        closes = []
         for k in range(1, horizon_max + 1):
             col = f'Fwd_{k}_PercMoveFromEntry'
             if col in row and pd.notna(row[col]):
                 pct = float(row[col]) / 100.0
                 closes.append(entry * (1.0 + pct))
-        return closes
+        return _simulate_close_path(entry, closes, side_sign, risk)
 
-    side_sign_series = df.apply(lambda r: _side_sign(side, r.get('Higher TF Trend')), axis=1)
-    df['_Expectancy_R'] = df.apply(
-        lambda r: _simulate_close_path(
-            r.get('Entry Price', np.nan),
-            path_closes(r),
-            side_sign_series.loc[r.name],
-            risk,
-        ),
-        axis=1,
-    )
+    df['_Expectancy_R'] = df.apply(get_expectancy, axis=1)
     df['_Win'] = (df['_Expectancy_R'] > 0).astype(int)
 
     # Build move profile percentiles for requested horizons

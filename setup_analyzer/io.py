@@ -1,7 +1,8 @@
 import io
 import os
 import zipfile
-from typing import Optional, Sequence
+from glob import glob
+from typing import Dict, Optional, Sequence
 
 import pandas as pd
 
@@ -66,3 +67,30 @@ def detect_horizons(df: pd.DataFrame, fallback: Sequence[int] = (1, 3, 5, 10)) -
         return list(fallback)
     return sorted(set(vals))
 
+
+def load_ohlc_prices(prices_dir: str) -> Dict[str, pd.DataFrame]:
+    """
+    Load all OHLC CSVs from a directory into a dict of {key: df}.
+    Key: {SYMBOL}_{TF}
+    DF: must have timestamp, open, high, low, close
+    """
+    if not os.path.isdir(prices_dir):
+        raise FileNotFoundError(f"Prices directory not found: {prices_dir}")
+
+    prices: Dict[str, pd.DataFrame] = {}
+    paths = glob(os.path.join(prices_dir, '*.csv'))
+    for p in paths:
+        fname = os.path.basename(p)
+        key, _ = os.path.splitext(fname)
+        try:
+            df = pd.read_csv(p, index_col='timestamp', parse_dates=['timestamp'])
+            # validation
+            expected_cols = {'open', 'high', 'low', 'close'}
+            if not expected_cols.issubset(df.columns):
+                print(f"Skipping {fname}: missing one of {expected_cols}")
+                continue
+            prices[key] = df
+        except Exception as e:
+            print(f"Error loading {fname}: {e}")
+            continue
+    return prices

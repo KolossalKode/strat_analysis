@@ -47,19 +47,31 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 pd.options.mode.chained_assignment = None
 
 # --- Constants ---
-SYMBOLS_LIST = ['SPY', 'QQQ', 'XLC', 'XLY', 'XLP', 'XLE', 'XLF', 'XLV',
-                'XLI', 'XLB', 'XLRE', 'XLK', 'XLU', 'MSFT', 'TSLA', 'GLD']
+SYMBOLS_LIST = [
+    'AAPL', 'ABBV', 'ADBE', 'AGG', 'AMD', 'AMZN', 'ARKK', 'AVGO', 'BA',
+    'BAC', 'C', 'CAT', 'COIN', 'COST', 'CRM', 'CVX', 'DBA', 'DE', 'DIA',
+    'DIS', 'EEM', 'EFA', 'F', 'FCX', 'FXE', 'FXI', 'GBTC', 'GDXJ', 'GE',
+    'GLD', 'GM', 'GOLD', 'GOOGL', 'GS', 'HAL', 'HD', 'HYG', 'INTC', 'IWM',
+    'IYR', 'JNJ', 'JPM', 'KO', 'LLY', 'LMT', 'LOW', 'LQD', 'MA', 'MCD',
+    'MDY', 'META', 'MRK', 'MS', 'MSFT', 'MU', 'NEM', 'NFLX', 'NVDA',
+    'ORCL', 'PANW', 'PFE', 'PG', 'PLTR', 'PYPL', 'QCOM', 'QQQ', 'ROKU',
+    'SBUX', 'SCHW', 'SHOP', 'SLB', 'SLV', 'SMH', 'SNOW', 'SPY', 'SQ',
+    'TGT', 'TIP', 'TLT', 'TMO', 'TSLA', 'UBER', 'UNG', 'UNH', 'UPS',
+    'USO', 'UUP', 'V', 'VIX', 'VNQ', 'VTI', 'WFC', 'WMT', 'XBI', 'XLB',
+    'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLY',
+    'XOM', 'ZM'
+]
 PERFORMANCE_LOOKAHEAD = 10
 MIN_HIGHER_TFS_FOR_FTFC = 3
 SLEEP_BETWEEN_SYMBOLS = 1
 
 TIMEFRAMES_API = {
-    'TIME_SERIES_INTRADAY': ['15min', '60min'],
+    'TIME_SERIES_INTRADAY': ['15min', '30min', '60min'],
     'TIME_SERIES_DAILY_ADJUSTED': 'Daily',
     'TIME_SERIES_WEEKLY_ADJUSTED': 'Weekly',
     'TIME_SERIES_MONTHLY_ADJUSTED': 'Monthly'
 }
-TIMEFRAME_ORDER = ['15min', '60min', 'Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly']
+TIMEFRAME_ORDER = ['15min', '30min', '60min', '4hour', 'Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly']
 
 REVERSAL_PATTERNS_STRAT = {
     ("3", "1", "2u"): "3-1-2u", ("3", "1", "2d"): "3-1-2d",
@@ -136,7 +148,7 @@ def label_candlesticks(df):
     if not df.empty: df.iloc[0, df.columns.get_loc('label')] = 'N/A'
     return df
 
-def resample_data(df, freq='QE'):
+def resample_data(df, freq):
     if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex): return None
     agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
     try:
@@ -308,6 +320,12 @@ def run_analysis(symbols, api_key, status_ui):
             
             # 2. Resample & 3. Label
             status_ui.write(f" Phase 2 & 3: Resampling & Labeling for {symbol}")
+            # Create 4-hour data from 60-min data
+            if '60min' in symbol_data:
+                four_hour_data = resample_data(symbol_data['60min'], '4H')
+                if four_hour_data is not None and not four_hour_data.empty:
+                    symbol_data['4hour'] = four_hour_data
+            # Create Quarterly and Yearly from Monthly
             monthly_data = symbol_data['Monthly']
             quarterly_data = resample_data(monthly_data, 'QE')
             if quarterly_data is not None and not quarterly_data.empty:
@@ -406,7 +424,32 @@ with scanner_tab:
     # --- Sidebar for Inputs ---
     with st.sidebar:
         st.header("⚙️ Scanner Configuration")
-        selected_symbols = st.multiselect("Select Stock Symbols", options=SYMBOLS_LIST, default=['SPY', 'QQQ'])
+
+        # --- Symbol Selection with "Select All" ---
+        if 'selected_symbols' not in st.session_state:
+            st.session_state.selected_symbols = ['SPY', 'QQQ']
+
+        def update_symbol_selection():
+            """Callback to update multiselect based on the checkbox."""
+            if st.session_state.get('select_all_symbols_toggle', False):
+                st.session_state.selected_symbols = SYMBOLS_LIST
+            else:
+                st.session_state.selected_symbols = [] # Clear selection on uncheck
+
+        # The checkbox's value is determined by whether all symbols are currently selected.
+        # This makes it responsive if the user manually deselects a symbol.
+        is_all_selected = (
+            'selected_symbols' in st.session_state and
+            len(st.session_state.selected_symbols) == len(SYMBOLS_LIST)
+        )
+        st.checkbox(
+            "Select All Symbols",
+            value=is_all_selected,
+            key='select_all_symbols_toggle',
+            on_change=update_symbol_selection,
+            help="Toggle to select or deselect all available symbols."
+        )
+        selected_symbols = st.multiselect("Select Stock Symbols", options=SYMBOLS_LIST, key='selected_symbols')
         run_button = st.button("🚀 Run Analysis")
 
     # --- Main Area for Outputs ---

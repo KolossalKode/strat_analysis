@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.strat.scanner</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/python3</string>
+        <string>/FULL/PATH/TO/strat_analysis/market_scheduler.py</string>
+        <string>--config</string>
+        <string>/FULL/PATH/TO/strat_analysis/alert_config.json</string>
+        <string>--daemon</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>POLYGON_API_KEY</key>
+        <string>YOUR_POLYGON_API_KEY_HERE</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/FULL/PATH/TO/strat_analysis</string>
+
+    <key>StandardOutPath</key>
+    <string>/FULL/PATH/TO/strat_analysis/logs/scheduler_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/FULL/PATH/TO/strat_analysis/logs/scheduler_stderr.log</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+</dict>
+</plist>

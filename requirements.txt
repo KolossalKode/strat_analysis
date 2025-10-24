@@ -1,7 +1,24 @@
-alpha-vantage>=2.3.1
-numpy>=1.24
-pandas>=2.0
-plotly>=5.18
+# Polygon.io
+polygon-api-client>=1.14.1
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+pyarrow>=14.0.0  # For Parquet
+
+# Visualization
+plotly>=5.18.0
+streamlit>=1.36.0
+
+# Excel export
+openpyxl>=3.1.0
+
+# Environment
 python-dotenv>=1.0.0
-streamlit>=1.36
-openpyxl>=3.1
+
+# Utilities
+requests>=2.31.0
+tqdm>=4.66.0  # Progress bars for CLI
+
+# Optional: For SMS alerts via Twilio (comment out if not using)
+# twilio>=8.0.0

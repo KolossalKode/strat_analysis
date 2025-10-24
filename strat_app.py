@@ -1,630 +1,427 @@
-# strat_app_v1_2025-09-01.py
+"""
+Main Streamlit application for the Strat Decision Engine.
+"""
 
 import streamlit as st
-import json
 import pandas as pd
-from datetime import date, datetime
-import os
-import numpy as np
 import plotly.graph_objects as go
-import time
-import warnings
-import tempfile
+from datetime import datetime, timedelta
+import os
+import logging
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    # Make dotenv optional. If not installed, user can enter API key manually.
-    load_dotenv = None
-import zipfile
-import io
+# Project imports
+from config import *
+from polygon_client import PolygonClient
+from polygon_manager import PolygonDataManager
+from options_analyzer import OptionsAnalyzer
+from setup_analyzer.engine import RiskModel, summarize_setups, build_ohlc_lookup, detect_ftfc_reversals
 
-# Analyzer imports
-try:
-    from setup_analyzer.engine import RiskModel, summarize_setups, to_machine_json
-    from setup_analyzer.io import load_detailed, coerce_dtypes, detect_horizons
-except Exception:
-    # Allow the app to run even if analyzer is not available; UI will guard usage
-    RiskModel = None
-    summarize_setups = None
-    to_machine_json = None
-    load_detailed = None
-    coerce_dtypes = None
-    detect_horizons = None
+# --- Page Configuration ---
+st.set_page_config(layout="wide", page_title="Strat Decision Engine", page_icon="📈")
 
-from alpha_vantage.timeseries import TimeSeries
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load environment variables from .env file at the start
-if load_dotenv:
-    load_dotenv()
-# ==============================================================================
-# SCRIPT CONFIGURATION & HELPER FUNCTIONS (Largely unchanged from original)
-# ==============================================================================
+# --- Session State Initialization ---
+def init_session_state():
+    defaults = {
+        'analysis_complete': False,
+        'detailed_df': None,
+        'summary_df': None,
+        'ohlc_cache_ready': False,
+        'polygon_manager': None,
+        'api_key_valid': False,
+        'active_signals': None,
+        'options_recommendation': None
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
-# Suppress warnings for a cleaner UI
-warnings.simplefilter(action='ignore', category=FutureWarning)
-warnings.simplefilter(action='ignore', category=UserWarning)
-pd.options.mode.chained_assignment = None
+init_session_state()
 
-# --- Constants ---
-SYMBOLS_LIST = [
-    'AAPL', 'ABBV', 'ADBE', 'AGG', 'AMD', 'AMZN', 'ARKK', 'AVGO', 'BA',
-    'BAC', 'C', 'CAT', 'COIN', 'COST', 'CRM', 'CVX', 'DBA', 'DE', 'DIA',
-    'DIS', 'EEM', 'EFA', 'F', 'FCX', 'FXE', 'FXI', 'GBTC', 'GDXJ', 'GE',
-    'GLD', 'GM', 'GOLD', 'GOOGL', 'GS', 'HAL', 'HD', 'HYG', 'INTC', 'IWM',
-    'IYR', 'JNJ', 'JPM', 'KO', 'LLY', 'LMT', 'LOW', 'LQD', 'MA', 'MCD',
-    'MDY', 'META', 'MRK', 'MS', 'MSFT', 'MU', 'NEM', 'NFLX', 'NVDA',
-    'ORCL', 'PANW', 'PFE', 'PG', 'PLTR', 'PYPL', 'QCOM', 'QQQ', 'ROKU',
-    'SBUX', 'SCHW', 'SHOP', 'SLB', 'SLV', 'SMH', 'SNOW', 'SPY', 'SQ',
-    'TGT', 'TIP', 'TLT', 'TMO', 'TSLA', 'UBER', 'UNG', 'UNH', 'UPS',
-    'USO', 'UUP', 'V', 'VIX', 'VNQ', 'VTI', 'WFC', 'WMT', 'XBI', 'XLB',
-    'XLC', 'XLE', 'XLF', 'XLI', 'XLK', 'XLP', 'XLRE', 'XLU', 'XLY',
-    'XOM', 'ZM'
-]
-PERFORMANCE_LOOKAHEAD = 10
-MIN_HIGHER_TFS_FOR_FTFC = 3
-SLEEP_BETWEEN_SYMBOLS = 1
+# --- Main App Structure ---
 
-TIMEFRAMES_API = {
-    'TIME_SERIES_INTRADAY': ['15min', '30min', '60min'],
-    'TIME_SERIES_DAILY_ADJUSTED': 'Daily',
-    'TIME_SERIES_WEEKLY_ADJUSTED': 'Weekly',
-    'TIME_SERIES_MONTHLY_ADJUSTED': 'Monthly'
-}
-TIMEFRAME_ORDER = ['15min', '30min', '60min', '4hour', 'Daily', 'Weekly', 'Monthly', 'Quarterly', 'Yearly']
+st.title("📈 Strat Decision Engine")
+st.markdown("Real-time FTFC reversal analysis powered by Polygon.io")
 
-REVERSAL_PATTERNS_STRAT = {
-    ("3", "1", "2u"): "3-1-2u", ("3", "1", "2d"): "3-1-2d",
-    ("2u", "1", "2d"): "2u-1-2d", ("2d", "1", "2u"): "2d-1-2u",
-    ("2u", "2d"): "2u-2d", ("2d", "2u"): "2d-2u",
-}
+# --- API Key Management ---
+api_key = st.sidebar.text_input("Polygon.io API Key", type="password", help="Enter your Polygon.io API key.")
+if not api_key:
+    api_key = os.environ.get(POLYGON_API_KEY_ENV)
 
-# Note: All functions from the original script are included here.
-# To keep this response clean, I've collapsed them. The full, runnable
-# code will have all functions (get_data, label_candlesticks, etc.) defined here.
-# The only change is replacing print() with status_ui.write() for UI feedback.
-
-# <editor-fold desc="Core Analysis Functions from Original Script">
-def get_data(symbol, function, interval, ts_client, status_ui):
-    max_retries = 3
-    retry_delay = 10
-    for attempt in range(max_retries):
-        try:
-            tf_name = interval or function.split('TIME_SERIES_')[-1].replace('_ADJUSTED', '')
-            status_ui.write(f"   Attempt {attempt+1}/{max_retries}: Fetching {tf_name} for {symbol}...")
-            
-            if function == 'TIME_SERIES_INTRADAY':
-                df, _ = ts_client.get_intraday(symbol=symbol, interval=interval, outputsize='full', extended_hours=False)
-            elif function == 'TIME_SERIES_DAILY_ADJUSTED':
-                df, _ = ts_client.get_daily_adjusted(symbol=symbol, outputsize='full')
-            elif function == 'TIME_SERIES_WEEKLY_ADJUSTED':
-                df, _ = ts_client.get_weekly_adjusted(symbol=symbol)
-            elif function == 'TIME_SERIES_MONTHLY_ADJUSTED':
-                df, _ = ts_client.get_monthly_adjusted(symbol=symbol)
-            else:
-                status_ui.write(f"Warning: Unknown function '{function}'.")
-                return None
-
-            if df is not None and not df.empty:
-                df.columns = [c.split('. ')[-1].replace(' ', '_') if '.' in c else c.replace(' ', '_') for c in df.columns]
-                df.index = pd.to_datetime(df.index, errors='coerce')
-                df = df[pd.notna(df.index)]
-                df = df.iloc[::-1]
-                for col in ['open', 'high', 'low', 'close', 'adjusted_close', 'volume']:
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                df.dropna(subset=['open', 'high', 'low', 'close'], inplace=True)
-                if df.empty: return None
-                status_ui.write(f"   OK: Fetched/cleaned {len(df)} rows for {symbol} - {tf_name}.")
-                return df
-            else:
-                time.sleep(1)
-                return None
-        except ValueError as ve:
-            status_ui.write(f"   ERROR (ValueError): {ve}")
-            if "rate limit" in str(ve): time.sleep(retry_delay * (2**attempt))
-            else: return None
-        except Exception as e:
-            status_ui.write(f"   ERROR (Unexpected): {type(e).__name__} - {e}")
-            if attempt == max_retries - 1: return None
-            else: time.sleep(retry_delay * (2**attempt))
-    status_ui.write(f"   Failed fetch for {symbol} - {tf_name} after retries.")
-    return None
-
-def label_candlesticks(df):
-    if df is None or df.empty: return df
-    if not isinstance(df.index, pd.DatetimeIndex): df['label'] = 'N/A'; return df
-    if not df.index.is_monotonic_increasing: df = df.sort_index()
-    prev_high = df['high'].shift(1); prev_low = df['low'].shift(1)
-    is_inside = (df['high'] <= prev_high) & (df['low'] >= prev_low)
-    is_up = (df['high'] > prev_high) & (df['low'] >= prev_low)
-    is_down = (df['high'] <= prev_high) & (df['low'] < prev_low)
-    is_outside = (df['high'] > prev_high) & (df['low'] < prev_low)
-    df['label'] = 'N/A'
-    df.loc[is_inside, 'label'] = '1'
-    df.loc[is_up, 'label'] = '2u'
-    df.loc[is_down, 'label'] = '2d'
-    df.loc[is_outside, 'label'] = '3'
-    if not df.empty: df.iloc[0, df.columns.get_loc('label')] = 'N/A'
-    return df
-
-def resample_data(df, freq):
-    if df is None or df.empty or not isinstance(df.index, pd.DatetimeIndex): return None
-    agg_dict = {'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'}
+if api_key and not st.session_state.polygon_manager:
     try:
-        df_resampled = df.resample(freq).agg(agg_dict).dropna(how='all')
-        return label_candlesticks(df_resampled)
-    except Exception:
-        return None
-
-def analyze_historical_ftfc_reversals(symbol_data, symbol, timeframe_order, status_ui, lookahead=10, min_higher_tfs=3):
-    status_ui.write(f"   Analyzing {symbol} for FTFC Reversals...")
-    historical_reversals = []
-    
-    # --- Precompute aligned labels ---
-    aligned_labels_cache = {}
-    available_tfs_info = [{'name': tf, 'index': df.index, 'labels': df['label']} 
-                          for tf in timeframe_order if (df := symbol_data.get(tf)) is not None and 'label' in df.columns]
-    
-    if not available_tfs_info: return pd.DataFrame()
-
-    all_indices = pd.concat([pd.Series(index=info['index']) for info in available_tfs_info]).index.unique()
-    base_aligned_df = pd.DataFrame(index=all_indices.sort_values())
-
-    for tf_info in available_tfs_info:
-        temp_aligned = pd.merge_asof(base_aligned_df, tf_info['labels'].rename(f'label_{tf_info["name"]}'),
-                                      left_index=True, right_index=True, direction='backward', tolerance=pd.Timedelta('30 days'))
-        aligned_labels_cache[tf_info["name"]] = temp_aligned[f'label_{tf_info["name"]}']
-
-    available_tfs_with_labels = sorted([tf for tf in timeframe_order if tf in aligned_labels_cache], key=lambda x: timeframe_order.index(x))
-
-    for i, smaller_tf in enumerate(available_tfs_with_labels):
-        smaller_df = symbol_data.get(smaller_tf)
-        if smaller_df is None or smaller_df.empty: continue
-        
-        higher_tfs = available_tfs_with_labels[i + 1 : i + 1 + min_higher_tfs]
-        if len(higher_tfs) < min_higher_tfs: continue
-
-        labels_df = pd.DataFrame({'smaller_label': aligned_labels_cache[smaller_tf].reindex(smaller_df.index)})
-        for k, htf in enumerate(higher_tfs):
-            labels_df[f'higher_label_{k}'] = aligned_labels_cache[htf].reindex(smaller_df.index)
-        
-        labels_df.dropna(inplace=True)
-        if labels_df.empty: continue
-
-        htf_2u_trend = (labels_df['higher_label_0'] == '2u')
-        htf_2d_trend = (labels_df['higher_label_0'] == '2d')
-        for k in range(1, min_higher_tfs):
-            htf_2u_trend &= (labels_df[f'higher_label_{k}'] == '2u')
-            htf_2d_trend &= (labels_df[f'higher_label_{k}'] == '2d')
-        
-        smaller_tf_rev_vs_2u = labels_df['smaller_label'].isin(['2d', '1', '3'])
-        smaller_tf_rev_vs_2d = labels_df['smaller_label'].isin(['2u', '1', '3'])
-        
-        reversal_indices = labels_df.index[(htf_2u_trend & smaller_tf_rev_vs_2u) | (htf_2d_trend & smaller_tf_rev_vs_2d)]
-        if reversal_indices.empty: continue
-        status_ui.write(f"         Found {len(reversal_indices)} potential reversals for {symbol} on {smaller_tf}.")
-
-        for reversal_time in reversal_indices:
-            try:
-                reversal_iloc = smaller_df.index.get_loc(reversal_time)
-                if reversal_iloc + 1 + lookahead > len(smaller_df): continue
-                
-                trend = '2u' if htf_2u_trend.loc[reversal_time] else '2d'
-                reversal_label = labels_df.loc[reversal_time, 'smaller_label']
-                
-                strat_pattern_found = "N/A"
-                if reversal_iloc >= 2:
-                    label_seq_3 = tuple(smaller_df['label'].iloc[reversal_iloc-2 : reversal_iloc+1])
-                    strat_pattern_found = REVERSAL_PATTERNS_STRAT.get(label_seq_3, "N/A")
-                if strat_pattern_found == "N/A" and reversal_iloc >= 1:
-                    label_seq_2 = tuple(smaller_df['label'].iloc[reversal_iloc-1 : reversal_iloc+1])
-                    strat_pattern_found = REVERSAL_PATTERNS_STRAT.get(label_seq_2, "N/A")
-
-                reversal_candle = smaller_df.iloc[reversal_iloc]
-                future_candles = smaller_df.iloc[reversal_iloc + 1 : reversal_iloc + 1 + lookahead]
-                entry_price = reversal_candle['close']
-                if pd.isna(entry_price) or entry_price == 0: continue
-
-                perf_data = {'Symbol': symbol, 'Reversal Time': reversal_time, 'Reversal Timeframe': smaller_tf,
-                             'FTFC Trigger Label': reversal_label, 'Strat Pattern': strat_pattern_found,
-                             'Higher TF Trend': trend, 'Entry Price': entry_price, 'Higher TFs Used': ", ".join(higher_tfs)}
-                
-                for k in range(1, lookahead + 1):
-                    if k - 1 < len(future_candles):
-                        future_close = future_candles.iloc[k - 1]['close']
-                        perc_move = (future_close - entry_price) / entry_price * 100
-                        perf_data[f'Fwd_{k}_PercMoveFromEntry'] = perc_move
-                
-                historical_reversals.append(perf_data)
-            except Exception:
-                continue
-
-    return pd.DataFrame(historical_reversals) if historical_reversals else pd.DataFrame()
-
-def aggregate_performance_results(historical_df, status_ui):
-    if historical_df is None or historical_df.empty:
-        status_ui.write("   No historical data to aggregate.")
-        return pd.DataFrame()
-    status_ui.write("   Aggregating performance results...")
-    
-    perc_move_cols = [col for col in historical_df.columns if col.endswith('_PercMoveFromEntry')]
-    grouping_keys = ['Symbol', 'Reversal Timeframe', 'Higher TF Trend', 'Strat Pattern', 'FTFC Trigger Label']
-    
-    try:
-        grouped = historical_df.groupby(grouping_keys)
-        summary = grouped[perc_move_cols].mean()
-        summary['Count'] = grouped.size()
-        summary.columns = [f'Avg_{col}' if col != 'Count' else col for col in summary.columns]
-        status_ui.write(f"   Aggregation complete. Summary has {len(summary)} rows.")
-        return summary.reset_index()
-    except Exception as e:
-        status_ui.write(f"   Error during aggregation: {e}")
-        return pd.DataFrame()
-
-def build_and_save_chart_to_memory(df, symbol, timeframe):
-    if df is None or df.empty: return None
-    try:
-        fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['open'], high=df['high'], low=df['low'], close=df['close'])])
-        label_y = np.where(df['label'].isin(['2d']), df['low'] * 0.998, df['high'] * 1.002)
-        fig.add_trace(go.Scatter(x=df.index, y=label_y, text=df['label'], mode='text', name='Strat Labels', showlegend=False))
-        fig.update_layout(title=f"{symbol} - {timeframe}", xaxis_rangeslider_visible=False)
-        return fig.to_html(full_html=False, include_plotlyjs='cdn')
-    except Exception:
-        return None
-# </editor-fold>
-
-# ==============================================================================
-# MAIN ANALYSIS WORKFLOW (ADAPTED FOR STREAMLIT)
-# ==============================================================================
-
-def run_analysis(symbols, api_key, status_ui):
-    """
-    Main execution function adapted for Streamlit.
-    Loops through symbols, performs analysis, and returns results.
-    """
-    start_time = datetime.now()
-    status_ui.write(f"--- Analysis Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-    
-    try:
-        ts_client = TimeSeries(key=api_key, output_format='pandas')
-        status_ui.write("OK: Alpha Vantage client initialized.")
-    except Exception as e:
-        st.error(f"ERROR: Failed to initialize Alpha Vantage client. Check API Key. Details: {e}")
-        return None, None, None
-
-    all_historical_reversals_list = []
-    chart_files = {} # Dict to store HTML content: {(symbol, tf): html_string}
-    processed_symbols_count = 0
-
-    with tempfile.TemporaryDirectory() as temp_dir:
-        for i, symbol in enumerate(symbols):
-            progress_bar.progress((i + 1) / len(symbols), text=f"Processing {symbol}...")
-            status_ui.write(f"\n--- Processing Symbol: {symbol} ---")
-            symbol_data = {}
-            
-            # 1. Fetch Data
-            for function, intervals_or_name in TIMEFRAMES_API.items():
-                if isinstance(intervals_or_name, list):
-                    for tf in intervals_or_name:
-                        df = get_data(symbol, function, tf, ts_client, status_ui)
-                        if df is not None: symbol_data[tf] = df
-                else:
-                    df = get_data(symbol, function, None, ts_client, status_ui)
-                    if df is not None: symbol_data[intervals_or_name] = df
-            
-            if not symbol_data or 'Monthly' not in symbol_data:
-                status_ui.write(f"Warning: Insufficient data for {symbol}. Skipping.")
-                time.sleep(SLEEP_BETWEEN_SYMBOLS)
-                continue
-            
-            # 2. Resample & 3. Label
-            status_ui.write(f" Phase 2 & 3: Resampling & Labeling for {symbol}")
-            # Create 4-hour data from 60-min data
-            if '60min' in symbol_data:
-                four_hour_data = resample_data(symbol_data['60min'], '4H')
-                if four_hour_data is not None and not four_hour_data.empty:
-                    symbol_data['4hour'] = four_hour_data
-            # Create Quarterly and Yearly from Monthly
-            monthly_data = symbol_data['Monthly']
-            quarterly_data = resample_data(monthly_data, 'QE')
-            if quarterly_data is not None and not quarterly_data.empty:
-                symbol_data['Quarterly'] = quarterly_data
-            yearly_data = resample_data(monthly_data, 'YE')
-            if yearly_data is not None and not yearly_data.empty:
-                symbol_data['Yearly'] = yearly_data
-            
-            for tf, df in symbol_data.items():
-                symbol_data[tf] = label_candlesticks(df)
-            
-            # 4. Generate Charts (in memory)
-            status_ui.write(f" Phase 4: Generating Charts for {symbol}")
-            for tf, df in symbol_data.items():
-                html_content = build_and_save_chart_to_memory(df, symbol, tf)
-                if html_content:
-                    chart_files[(symbol, tf)] = html_content
-
-            # 5. Analyze FTFC
-            status_ui.write(f" Phase 5: Analyzing FTFC Reversals for {symbol}")
-            symbol_reversals_df = analyze_historical_ftfc_reversals(symbol_data, symbol, TIMEFRAME_ORDER, status_ui)
-            
-            if not symbol_reversals_df.empty:
-                all_historical_reversals_list.append(symbol_reversals_df)
-                processed_symbols_count += 1
-                status_ui.write(f"   Finished analysis for {symbol}. Found {len(symbol_reversals_df)} reversals.")
-            else:
-                status_ui.write(f"   No reversals found for {symbol}.")
-            
-            time.sleep(SLEEP_BETWEEN_SYMBOLS)
-
-    # 7. Combine & 8. Aggregate Results
-    if not all_historical_reversals_list:
-        st.warning("No historical reversals found across any of the selected symbols.")
-        return None, None, None
-        
-    status_ui.write("\n--- Combining and Aggregating All Results ---")
-    combined_df = pd.concat(all_historical_reversals_list, ignore_index=True)
-    summary_df = aggregate_performance_results(combined_df, status_ui)
-    
-    end_time = datetime.now()
-    status_ui.write(f"\n--- Analysis Complete: {end_time.strftime('%Y-%m-%d %H:%M:%S')} ---")
-    status_ui.write(f"Total execution time: {end_time - start_time}")
-    
-    return combined_df, summary_df, chart_files
-
-def create_zip_for_download(detailed_df, summary_df, chart_files):
-    """Creates a zip file in memory containing all results."""
-    zip_buffer = io.BytesIO()
-    today_str = date.today().strftime("%Y-%m-%d")
-
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        # 1. Add Excel files
-        if detailed_df is not None and not detailed_df.empty:
-            excel_buffer = io.BytesIO()
-            detailed_df.to_excel(excel_buffer, index=False, engine='openpyxl')
-            zip_file.writestr(f"{today_str}_FTFC_Performance_Detailed.xlsx", excel_buffer.getvalue())
-
-        if summary_df is not None and not summary_df.empty:
-            excel_buffer = io.BytesIO()
-            summary_df.to_excel(excel_buffer, index=False, engine='openpyxl')
-            zip_file.writestr(f"{today_str}_FTFC_Performance_Summary.xlsx", excel_buffer.getvalue())
-
-        # 2. Add chart HTML files
-        if chart_files:
-            for (symbol, tf), html_content in chart_files.items():
-                zip_file.writestr(f"charts/{symbol}/{symbol}_{tf}_Chart.html", html_content)
-                
-    return zip_buffer.getvalue()
-
-# ==============================================================================
-# STREAMLIT UI
-# ==============================================================================
-
-st.set_page_config(layout="wide", page_title="FTFC Reversal Analysis")
-
-st.title("📈 The Strat: FTFC Reversal Analysis")
-st.markdown("""
-This application analyzes historical stock data to identify 'Full Timeframe Continuity' (FTFC) reversals based on 'The Strat' methodology.
-Use the Scanner to produce a results ZIP, then open the Analyzer tab to rank setups and export JSON.
-""")
-
-# Session state (shared by tabs)
-if 'analysis_complete' not in st.session_state:
-    st.session_state.analysis_complete = False
-if 'zip_data' not in st.session_state:
-    st.session_state.zip_data = None
-if 'summary_df' not in st.session_state:
-    st.session_state.summary_df = None
-
-# Tabs for Scanner and Analyzer
-scanner_tab, analyzer_tab = st.tabs(["Scanner", "Analyzer"])
-
-# --- Sidebar for Inputs ---
-with scanner_tab:
-    # --- Sidebar for Inputs ---
-    with st.sidebar:
-        st.header("⚙️ Scanner Configuration")
-
-        # --- Symbol Selection with "Select All" ---
-        if 'selected_symbols' not in st.session_state:
-            st.session_state.selected_symbols = ['SPY', 'QQQ']
-
-        def update_symbol_selection():
-            """Callback to update multiselect based on the checkbox."""
-            if st.session_state.get('select_all_symbols_toggle', False):
-                st.session_state.selected_symbols = SYMBOLS_LIST
-            else:
-                st.session_state.selected_symbols = [] # Clear selection on uncheck
-
-        # The checkbox's value is determined by whether all symbols are currently selected.
-        # This makes it responsive if the user manually deselects a symbol.
-        is_all_selected = (
-            'selected_symbols' in st.session_state and
-            len(st.session_state.selected_symbols) == len(SYMBOLS_LIST)
-        )
-        st.checkbox(
-            "Select All Symbols",
-            value=is_all_selected,
-            key='select_all_symbols_toggle',
-            on_change=update_symbol_selection,
-            help="Toggle to select or deselect all available symbols."
-        )
-        selected_symbols = st.multiselect("Select Stock Symbols", options=SYMBOLS_LIST, key='selected_symbols')
-        run_button = st.button("🚀 Run Analysis")
-
-    # --- Main Area for Outputs ---
-    if run_button:
-        api_key = os.environ.get("ALPHA_VANTAGE_API_KEY")
-        if not selected_symbols:
-            st.error("❌ Please select at least one symbol to analyze.")
+        manager = PolygonDataManager(api_key)
+        # Test connection
+        if manager.client.get_snapshot('SPY'):
+            st.session_state.polygon_manager = manager
+            st.session_state.api_key_valid = True
+            st.sidebar.success("API Key Valid & Connected!")
         else:
-            st.session_state.analysis_complete = False
-            st.session_state.zip_data = None
-            st.session_state.summary_df = None
+            st.sidebar.error("API Key is invalid.")
+            st.session_state.api_key_valid = False
+    except Exception as e:
+        st.sidebar.error(f"Connection failed: {e}")
+        st.session_state.api_key_valid = False
 
-            st.subheader("📊 Analysis in Progress...")
-            progress_bar = st.progress(0, text="Starting...")
-            status_container = st.container(height=300, border=True)
+# Guard for API key
+if not st.session_state.api_key_valid:
+    st.error("Please provide a valid Polygon.io API key in the sidebar to proceed.")
+    st.stop()
 
-            with st.spinner('Running... this may take several minutes depending on the number of symbols.'):
-                detailed_df, summary_df, charts = run_analysis(selected_symbols, api_key, status_container)
+# --- UI Tabs ---
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Scanner", "Live Signals", "Analyzer", "Options", "Settings"])
 
-                if detailed_df is not None:
-                    st.session_state.analysis_complete = True
-                    st.session_state.summary_df = summary_df
-                    st.session_state.zip_data = create_zip_for_download(detailed_df, summary_df, charts)
-                    progress_bar.progress(1.0, text="Analysis Complete!")
-                    st.success("✅ Analysis complete! Results are ready for download.")
-                else:
-                    progress_bar.progress(1.0, text="Analysis Finished with No Results.")
-                    st.warning("Analysis finished, but no valid reversal data was generated.")
+# =============================================================================
+# TAB 1: SCANNER
+# =============================================================================
+with tab1:
+    st.header("Scanner: Historical Analysis")
+    
+    with st.sidebar:
+        st.header("Scanner Configuration")
+        symbols_to_scan = st.multiselect("Symbols", options=EXTENDED_SYMBOLS, default=DEFAULT_SYMBOLS[:4])
+        timeframes_to_scan = st.multiselect("Timeframes", options=list(TIMEFRAMES.keys()), default=['1hour', '4hour', 'daily', 'weekly'])
+        use_ohlc_precision = st.checkbox("Use OHLC Precision", value=True)
+        months_history = st.slider("Months of History", 1, 24, OHLC_MONTHS_BACK)
+        min_confluence = st.number_input("Min Higher TF Confluence", 2, 5, MIN_HIGHER_TFS_FOR_FTFC)
+        run_scanner_button = st.button("🚀 Run Scanner")
+
+    if run_scanner_button:
+        st.session_state.analysis_complete = False
+        st.subheader("Analysis in Progress...")
+        progress_bar = st.progress(0, text="Starting...")
+        log_container = st.container(height=300, border=True)
+        
+        manager = st.session_state.polygon_manager
+        all_data = {}
+        total_fetches = len(symbols_to_scan) * len(timeframes_to_scan)
+        
+        def progress_callback(completed, total, symbol, tf):
+            progress_bar.progress(completed / total, text=f"Fetching {symbol} {tf}...")
+            log_container.info(f"Fetching {symbol} {tf}...")
+
+        with st.spinner("Fetching data from cache/API..."):
+            all_data = manager.batch_fetch(symbols_to_scan, timeframes_to_scan, months_history, progress_callback)
+
+        if not all_data:
+            log_container.error("No data fetched. Check API key and symbols.")
+            st.error("Failed to fetch data. Please check your configuration.")
+            st.stop()
+
+        log_container.info(f"Fetched data for {len(all_data)} symbol/timeframe combinations.")
+
+        # Step 2: Detect FTFC reversals
+        progress_bar.progress(0.5, text="Detecting FTFC reversals...")
+        log_container.info("Analyzing patterns and higher timeframe confluence...")
+
+        try:
+            detailed_df = detect_ftfc_reversals(
+                ohlc_data=all_data,
+                min_higher_tfs=min_confluence,
+                performance_lookahead_bars=PERFORMANCE_LOOKAHEAD_BARS
+            )
+
+            if detailed_df.empty:
+                log_container.warning("No FTFC reversals found with current criteria.")
+                st.warning("No FTFC reversal setups found. Try lowering the confluence threshold or expanding symbol/timeframe selection.")
+                st.stop()
+
+            log_container.info(f"Found {len(detailed_df)} reversal setups.")
+
+            # Step 3: Run simulations if OHLC precision is enabled
+            progress_bar.progress(0.7, text="Running performance simulations...")
+
+            risk_model = RiskModel(
+                stop_pct=DEFAULT_STOP_PCT,
+                contracts=DEFAULT_CONTRACTS,
+                scale_out_R=DEFAULT_SCALE_OUT_R,
+                trailing_after_R=DEFAULT_TRAILING_AFTER_R,
+                trailing_gap_R=DEFAULT_TRAILING_GAP_R
+            )
+
+            ohlc_cache = None
+            if use_ohlc_precision:
+                log_container.info("Building OHLC lookup cache for precise simulation...")
+                ohlc_cache = build_ohlc_lookup(detailed_df, manager, PERFORMANCE_LOOKAHEAD_BARS)
+                log_container.info(f"Built OHLC cache for {len(ohlc_cache)} reversals.")
+
+            # Step 4: Summarize setups
+            progress_bar.progress(0.85, text="Summarizing setup performance...")
+            log_container.info("Aggregating statistics by pattern and timeframe...")
+
+            summary_df = summarize_setups(
+                df=detailed_df,
+                group_by=['Timeframe', 'Pattern'],
+                horizons=[1, 3, 5, 10],
+                lookback_weeks=52,
+                side='auto',
+                min_samples=1,
+                risk=risk_model,
+                ohlc_cache=ohlc_cache
+            )
+
+            # Calculate targets and stops for detailed view
+            detailed_df['Stop Price'] = detailed_df.apply(
+                lambda row: row['Entry Price'] * (1 - DEFAULT_STOP_PCT) if row['Higher TF Trend'] == '2u'
+                else row['Entry Price'] * (1 + DEFAULT_STOP_PCT),
+                axis=1
+            )
+            detailed_df['T1'] = detailed_df.apply(
+                lambda row: row['Entry Price'] * (1 + DEFAULT_STOP_PCT * DEFAULT_SCALE_OUT_R[0]) if row['Higher TF Trend'] == '2u'
+                else row['Entry Price'] * (1 - DEFAULT_STOP_PCT * DEFAULT_SCALE_OUT_R[0]),
+                axis=1
+            )
+            detailed_df['T2'] = detailed_df.apply(
+                lambda row: row['Entry Price'] * (1 + DEFAULT_STOP_PCT * DEFAULT_SCALE_OUT_R[1]) if row['Higher TF Trend'] == '2u'
+                else row['Entry Price'] * (1 - DEFAULT_STOP_PCT * DEFAULT_SCALE_OUT_R[1]),
+                axis=1
+            )
+
+            # Calculate how many bars ago each reversal occurred
+            now = pd.Timestamp.now(tz='America/New_York')
+            detailed_df['Bars Ago'] = detailed_df.apply(
+                lambda row: len(all_data.get((row['Symbol'], row['Timeframe']), pd.DataFrame())[
+                    all_data.get((row['Symbol'], row['Timeframe']), pd.DataFrame()).index > row['Reversal Time']
+                ]) if (row['Symbol'], row['Timeframe']) in all_data else 0,
+                axis=1
+            )
+
+            # Store in session state
+            st.session_state.detailed_df = detailed_df
+            st.session_state.summary_df = summary_df
+            st.session_state.analysis_complete = True
+            st.session_state.ohlc_cache_ready = use_ohlc_precision
+
+            progress_bar.progress(1.0, text="Analysis Complete!")
+            log_container.success(f"Analysis complete! Found {len(detailed_df)} reversals across {len(summary_df)} unique setups.")
+            st.success(f"Scanner complete! Analyzed {len(symbols_to_scan)} symbols × {len(timeframes_to_scan)} timeframes.")
+
+        except Exception as e:
+            log_container.error(f"Error during analysis: {str(e)}")
+            st.error(f"Analysis failed: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
 
     if st.session_state.analysis_complete:
-        st.subheader("📈 Performance Summary")
-        st.dataframe(st.session_state.summary_df)
+        st.subheader("Scanner Results")
 
-        st.download_button(
-           label="📥 Download Results (.zip)",
-           data=st.session_state.zip_data,
-           file_name=f"{date.today().strftime('%Y-%m-%d')}_Strat_Analysis_Results.zip",
-           mime="application/zip",
-        )
+        # Summary cards
+        col1, col2, col3, col4 = st.columns(4)
 
-with analyzer_tab:
-    st.header("🔍 Setup Analyzer")
+        with col1:
+            st.metric("Total Setups Found", len(st.session_state.detailed_df))
 
-    if summarize_setups is None:
-        st.info("Analyzer module is not available. Please ensure the 'setup_analyzer' package exists in this project.")
-    else:
-        # Source selection
-        src_choice = st.radio("Select Input Source", ["Use current run's ZIP", "Upload ZIP/Excel/CSV"], index=0)
+        with col2:
+            st.metric("Unique Patterns", len(st.session_state.summary_df))
 
-        detailed_df = None
-        load_error = None
-
-        if src_choice == "Use current run's ZIP":
-            if st.session_state.get('zip_data'):
-                try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tf:
-                        tf.write(st.session_state.zip_data)
-                        tmp_zip_path = tf.name
-                    detailed_df = load_detailed(tmp_zip_path)
-                    detailed_df = coerce_dtypes(detailed_df)
-                except Exception as e:
-                    load_error = str(e)
-                finally:
-                    try:
-                        os.remove(tmp_zip_path)
-                    except Exception:
-                        pass
+        with col3:
+            if 'win_rate' in st.session_state.summary_df.columns:
+                avg_win_rate = st.session_state.summary_df['win_rate'].mean() * 100
+                st.metric("Avg Win Rate", f"{avg_win_rate:.1f}%")
             else:
-                st.warning("No ZIP available from the Scanner yet. Run an analysis first or upload a file.")
+                st.metric("Avg Win Rate", "N/A")
+
+        with col4:
+            if 'expectancy_R' in st.session_state.summary_df.columns:
+                avg_exp = st.session_state.summary_df['expectancy_R'].mean()
+                st.metric("Avg Expectancy", f"{avg_exp:.2f}R")
+            else:
+                st.metric("Avg Expectancy", "N/A")
+
+        st.divider()
+
+        # Tabs for different views
+        result_tab1, result_tab2, result_tab3 = st.tabs(["Overview", "Detailed Reversals", "Downloads"])
+
+        with result_tab1:
+            st.subheader("Top Setups by Performance")
+
+            # Display summary table
+            display_summary = st.session_state.summary_df.copy()
+
+            # Format columns for display
+            if 'win_rate' in display_summary.columns:
+                display_summary['Win Rate %'] = (display_summary['win_rate'] * 100).round(1)
+            if 'expectancy_R' in display_summary.columns:
+                display_summary['Expectancy R'] = display_summary['expectancy_R'].round(2)
+            if 'frequency_per_week' in display_summary.columns:
+                display_summary['Freq/Week'] = display_summary['frequency_per_week'].round(2)
+
+            # Select display columns
+            display_cols = ['Timeframe', 'Pattern']
+            if 'sample_count' in display_summary.columns:
+                display_cols.append('sample_count')
+            if 'Win Rate %' in display_summary.columns:
+                display_cols.append('Win Rate %')
+            if 'Expectancy R' in display_summary.columns:
+                display_cols.append('Expectancy R')
+            if 'Freq/Week' in display_summary.columns:
+                display_cols.append('Freq/Week')
+
+            st.dataframe(
+                display_summary[display_cols] if all(c in display_summary.columns for c in display_cols) else display_summary,
+                use_container_width=True,
+                height=400
+            )
+
+        with result_tab2:
+            st.subheader("All Reversal Events")
+
+            # Add filters
+            filter_col1, filter_col2, filter_col3 = st.columns(3)
+
+            with filter_col1:
+                if 'Symbol' in st.session_state.detailed_df.columns:
+                    symbol_filter = st.multiselect(
+                        "Filter by Symbol",
+                        options=sorted(st.session_state.detailed_df['Symbol'].unique()),
+                        default=None
+                    )
+
+            with filter_col2:
+                if 'Timeframe' in st.session_state.detailed_df.columns:
+                    tf_filter = st.multiselect(
+                        "Filter by Timeframe",
+                        options=st.session_state.detailed_df['Timeframe'].unique(),
+                        default=None
+                    )
+
+            with filter_col3:
+                if 'Pattern' in st.session_state.detailed_df.columns:
+                    pattern_filter = st.multiselect(
+                        "Filter by Pattern",
+                        options=sorted(st.session_state.detailed_df['Pattern'].unique()),
+                        default=None
+                    )
+
+            # Apply filters
+            filtered_df = st.session_state.detailed_df.copy()
+            if symbol_filter:
+                filtered_df = filtered_df[filtered_df['Symbol'].isin(symbol_filter)]
+            if tf_filter:
+                filtered_df = filtered_df[filtered_df['Timeframe'].isin(tf_filter)]
+            if pattern_filter:
+                filtered_df = filtered_df[filtered_df['Pattern'].isin(pattern_filter)]
+
+            # Format for display
+            display_detailed = filtered_df.copy()
+
+            # Select key columns for display
+            key_cols = ['Symbol', 'Timeframe', 'Pattern', 'Reversal Time',
+                       'Entry Price', 'Stop Price', 'T1', 'T2',
+                       'Higher TF Trend', 'FTFC Count', 'Bars Ago']
+
+            display_cols = [col for col in key_cols if col in display_detailed.columns]
+
+            st.dataframe(
+                display_detailed[display_cols],
+                use_container_width=True,
+                height=500
+            )
+
+            st.caption(f"Showing {len(filtered_df)} of {len(st.session_state.detailed_df)} reversals")
+
+        with result_tab3:
+            st.subheader("Export Results")
+
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.download_button(
+                    label="Download Detailed CSV",
+                    data=st.session_state.detailed_df.to_csv(index=False),
+                    file_name=f"ftfc_detailed_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+
+            with col2:
+                st.download_button(
+                    label="Download Summary CSV",
+                    data=st.session_state.summary_df.to_csv(index=True),
+                    file_name=f"ftfc_summary_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+
+            st.info("Additional export formats (Excel, JSON, ZIP) coming soon!")
+
+# =============================================================================
+# TAB 2: LIVE SIGNALS
+# =============================================================================
+with tab2:
+    st.header("Live Signals: Real-time Opportunities")
+    # Placeholder content
+    st.info("Live signals feature is under development.")
+
+# =============================================================================
+# TAB 3: ANALYZER
+# =============================================================================
+with tab3:
+    st.header("Analyzer: Deep-Dive and Ranking")
+    # Placeholder content
+    st.info("Analyzer feature is under development.")
+
+# =============================================================================
+# TAB 4: OPTIONS
+# =============================================================================
+with tab4:
+    st.header("Options: Strategy Recommendations")
+    
+    with st.sidebar:
+        st.header("Options Analysis")
+        if st.session_state.detailed_df is not None:
+            setup_options = [f"{row.Symbol} {row.Timeframe} {row.Pattern}" for index, row in st.session_state.detailed_df.iterrows()]
+            selected_setup = st.selectbox("Select a setup from Scanner", options=setup_options)
         else:
-            uploaded = st.file_uploader("Upload results ZIP/Excel/CSV", type=["zip", "xlsx", "csv"], accept_multiple_files=False)
-            if uploaded is not None:
-                try:
-                    suffix = '.zip' if uploaded.name.lower().endswith('.zip') else ('.xlsx' if uploaded.name.lower().endswith('.xlsx') else '.csv')
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tf:
-                        tf.write(uploaded.read())
-                        tmp_path = tf.name
-                    detailed_df = load_detailed(tmp_path)
-                    detailed_df = coerce_dtypes(detailed_df)
-                except Exception as e:
-                    load_error = str(e)
-                finally:
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
+            st.text_input("Symbol", value="SPY")
+        analyze_options_button = st.button("🔍 Analyze Options")
 
-        if load_error:
-            st.error(f"Failed to load input: {load_error}")
+    if analyze_options_button and 'selected_setup' in locals():
+        # Extract details from selected setup
+        symbol, tf, pattern = selected_setup.split()
+        setup_row = st.session_state.detailed_df.iloc[0] # Simplified
+        
+        analyzer = OptionsAnalyzer(st.session_state.polygon_manager.client)
+        with st.spinner("Analyzing options..."):
+            recommendation = analyzer.analyze_setup_for_options(
+                symbol=setup_row['Symbol'],
+                entry_price=setup_row['Entry'],
+                stop_price=setup_row['Stop'],
+                target_r1=setup_row['T1'],
+                target_r2=setup_row['T2'],
+                expectancy_r=setup_row['Expectancy'],
+                win_rate=setup_row['Win%'] / 100,
+                side='long' if 'u' in setup_row['Pattern'] else 'short'
+            )
+            st.session_state.options_recommendation = recommendation
 
-        # If we have data, show controls and run analyzer
-        if detailed_df is not None and not detailed_df.empty:
-            st.success(f"Loaded {len(detailed_df):,} detailed records.")
+    if st.session_state.options_recommendation:
+        analyzer = OptionsAnalyzer(st.session_state.polygon_manager.client)
+        st.markdown(analyzer.format_recommendation_for_display(st.session_state.options_recommendation))
 
-            # Parameter form
-            with st.form("analyzer_form"):
-                # Symbol filter
-                symbol_options = sorted(detailed_df['Symbol'].dropna().unique().tolist()) if 'Symbol' in detailed_df.columns else []
-                selected_symbols = st.multiselect(
-                    "Filter by symbol(s)", options=symbol_options, default=symbol_options,
-                    help="Choose one or more symbols to include in the analysis"
-                ) if symbol_options else []
+# =============================================================================
+# TAB 5: SETTINGS
+# =============================================================================
+with tab5:
+    st.header("Settings & Cache Management")
+    st.subheader("Cache Statistics")
 
-                # Group-by options from columns (common defaults first)
-                default_group = ["Reversal Timeframe", "Strat Pattern"]
-                available_cols = list(detailed_df.columns)
-                # Ensure defaults exist
-                group_defaults = [c for c in default_group if c in available_cols] or available_cols[:2]
-                group_by = st.multiselect("Group setups by", options=available_cols, default=group_defaults)
+    if st.button("Refresh Cache Stats"):
+        st.session_state.cache_stats = st.session_state.polygon_manager.get_cache_stats()
 
-                # Horizons
-                detected = detect_horizons(detailed_df)
-                horizons_text = st.text_input("Forward bar horizons (comma-separated)", value=",".join(str(x) for x in detected))
-                horizons = sorted({int(x.strip()) for x in horizons_text.split(',') if x.strip().isdigit()})
-
-                # Other knobs
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    top_n = st.number_input("Top N", min_value=1, max_value=100, value=10, step=1)
-                with col2:
-                    lookback_weeks = st.number_input("Lookback (weeks)", min_value=1, max_value=520, value=52, step=1)
-                with col3:
-                    min_samples = st.number_input("Min samples", min_value=1, max_value=1000, value=10, step=1)
-                with col4:
-                    side = st.selectbox("Side", options=["long", "short", "auto"], index=0)
-
-                submitted = st.form_submit_button("Run Analyzer")
-
-            if submitted:
-                with st.spinner("Analyzing setups..."):
-                    try:
-                        # Apply symbol filter if provided
-                        df_input = detailed_df
-                        if selected_symbols:
-                            df_input = df_input[df_input['Symbol'].isin(selected_symbols)]
-
-                        risk = RiskModel()
-                        summary = summarize_setups(
-                            df_input,
-                            group_by=group_by,
-                            horizons=horizons,
-                            lookback_weeks=int(lookback_weeks),
-                            side=side,
-                            min_samples=int(min_samples),
-                            risk=risk,
-                        )
-
-                        if summary.empty:
-                            st.warning("No setups met the criteria. Try lowering 'Min samples' or adjusting horizons.")
-                        else:
-                            st.subheader("🏆 Top Ranked Setups")
-                            cols_show = group_by + ["sample_count", "frequency_per_week", "win_rate", "expectancy_R"]
-                            top_summary = summary.head(int(top_n))
-                            st.dataframe(top_summary[cols_show], use_container_width=True)
-
-                            # Full summary table
-                            with st.expander("Show full summary table", expanded=True):
-                                st.dataframe(summary, use_container_width=True)
-
-                            # Downloads
-                            payload = to_machine_json(summary, group_by=group_by, horizons=horizons, risk=risk)
-                            json_bytes = json.dumps(payload, indent=2).encode("utf-8")
-                            st.download_button(
-                                label="📥 Download Insights (JSON)",
-                                data=json_bytes,
-                                file_name=f"{date.today().strftime('%Y-%m-%d')}_setup_insights.json",
-                                mime="application/json",
-                            )
-
-                            csv_bytes = top_summary.to_csv(index=False).encode('utf-8')
-                            st.download_button(
-                                label="📥 Download Top-N (CSV)",
-                                data=csv_bytes,
-                                file_name=f"{date.today().strftime('%Y-%m-%d')}_top_setups.csv",
-                                mime="text/csv",
-                            )
-                    except Exception as e:
-                        st.error(f"Analyzer failed: {e}")
+    if 'cache_stats' in st.session_state and st.session_state.cache_stats is not None:
+        st.dataframe(st.session_state.cache_stats)
+    
+    st.subheader("Cache Actions")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("🔄 Refresh Stale Cache"):
+            # Placeholder for selective refresh
+            st.toast("Refreshing stale items...")
+    with col2:
+        if st.button("🗑️ Clear All Cache", type="primary"):
+            st.session_state.polygon_manager.clear_cache()
+            st.toast("All cache cleared!")
+            # Clear stats view
+            if 'cache_stats' in st.session_state: del st.session_state.cache_stats

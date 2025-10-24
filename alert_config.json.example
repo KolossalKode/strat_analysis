@@ -1,0 +1,50 @@
+{
+  "symbols": [
+    "SPY", "QQQ", "IWM", "DIA",
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA",
+    "AMD", "AVGO",
+    "XLE", "XLF", "XLK"
+  ],
+  "timeframes": ["1hour", "4hour", "daily", "weekly"],
+  "use_ohlc_precision": true,
+
+  "alert_filter": {
+    "min_expectancy": 0.4,
+    "min_win_rate": 0.55,
+    "min_ftfc_count": 3,
+    "max_bars_ago": 3,
+    "max_alerts": 10
+  },
+
+  "notification": {
+    "service": "telegram",
+    "telegram_bot_token": "YOUR_BOT_TOKEN_HERE",
+    "telegram_chat_id": "YOUR_CHAT_ID_HERE"
+  },
+
+  "_comment_twilio": "Uncomment and configure for SMS via Twilio",
+  "_notification_twilio": {
+    "service": "twilio",
+    "twilio_account_sid": "YOUR_ACCOUNT_SID",
+    "twilio_auth_token": "YOUR_AUTH_TOKEN",
+    "twilio_from_number": "+1234567890",
+    "twilio_to_number": "+1234567890"
+  },
+
+  "_comment_email": "Uncomment and configure for email alerts",
+  "_notification_email": {
+    "service": "email",
+    "email_smtp_server": "smtp.gmail.com",
+    "email_smtp_port": 587,
+    "email_username": "your_email@gmail.com",
+    "email_password": "your_app_password",
+    "email_to": "your_email@gmail.com"
+  },
+
+  "_comment_pushover": "Uncomment and configure for Pushover push notifications",
+  "_notification_pushover": {
+    "service": "pushover",
+    "pushover_user_key": "YOUR_USER_KEY",
+    "pushover_api_token": "YOUR_API_TOKEN"
+  }
+}
